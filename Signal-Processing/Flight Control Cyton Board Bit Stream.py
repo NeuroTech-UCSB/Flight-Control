@@ -1,8 +1,9 @@
 import random
 import struct
 import time
+import sys
 
-START_BYTE = 0xA1
+START_BYTE = 0xA0
 STOP_BYTES = [0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6] 
 
 def int24_to_bytes(value):
@@ -49,24 +50,39 @@ def cyton_byte_stream(packet_rate_hz=250, max_packets=None):
         packet = generate_cyton_packet(sample_num)
         sample_num = (sample_num + 1) % 256
         packets_sent += 1
+        byte_interval = interval / 33
 
         for byte in packet:
             yield byte
+            time.sleep(byte_interval)
 
-        time.sleep(interval)
-        
+
 stream = cyton_byte_stream(max_packets=100)
 
 buffer = bytearray()
 
+validPackets = []
+
 while True:
-    byte = next(stream)
+    try:
+        byte = next(stream)
+    except StopIteration:
+        break
     buffer.append(byte)
     
     if len(buffer) >= 33:
         if buffer[0] == 0xA0 and buffer[32] in STOP_BYTES:
             packet = buffer[:33]
+            if len(packet) != 33:
+                continue
             buffer = buffer[33:]
+            validPackets.append(packet)
             print("Valid packet:", packet.hex())
         else:
-            buffer.pop(0)  # resync
+            try:
+                next_start = buffer.index(START_BYTE, 1)
+                buffer = buffer[next_start:]
+            except ValueError:
+                buffer.clear()
+
+print("Num of Valid Packets: ",  len(validPackets))
