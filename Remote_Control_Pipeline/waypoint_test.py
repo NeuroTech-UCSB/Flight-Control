@@ -1,158 +1,93 @@
+import threading
 from pymavlink import mavutil
-import math
 import time
+import math
 
-# HEARTBEAT: Establish connection
-print("Connecting to BCI-Drone Pipeline...")
+# --- 1. THE POST OFFICE (Global State) ---
+# This dictionary will hold the latest info so functions don't have to "read" the port
+drone_state = {
+    "last_heartbeat": time.time(),
+    "lat": 0.0,
+    "lon": 0.0,
+    "alt": 0.0,
+    "mode": "UNKNOWN",
+    "armed": False,
+    "is_running": True
+}
+
+# --- 2. THE TELEMETRY THREAD (The only one allowed to read) ---
+def telemetry_reader(master):
+    global drone_state
+    print("[Thread] Post Office is Open. Reading all telemetry...")
+    while drone_state["is_running"]:
+        msg = master.recv_match(blocking=False)
+        if msg:
+            m_type = msg.get_type()
+            if m_type == 'HEARTBEAT':
+                drone_state["last_heartbeat"] = time.time()
+                drone_state["mode"] = master.flightmode
+                drone_state["armed"] = master.motors_armed()
+            elif m_type == 'GLOBAL_POSITION_INT':
+                drone_state["lat"] = msg.lat / 1e7
+                drone_state["lon"] = msg.lon / 1e7
+                drone_state["alt"] = msg.relative_alt # mm
+        time.sleep(0.01) # 100Hz loop
+
+# --- 3. REFACTORED FLIGHT FUNCTIONS ---
+def wait_for_arm(target_state=True, timeout=10):
+    """Checks the Post Office for armed status instead of reading the port."""
+    start = time.time()
+    while drone_state["armed"] != target_state:
+        if time.time() - start > timeout:
+            raise Exception("Arming timeout - check Pre-arm messages in SITL")
+        time.sleep(0.2)
+    print("Armed confirmation received from Post Office!")
+
+def take_off_safe(master, altitude):
+    print(f"🚀 Initiating Takeoff to {altitude}m...")
+    
+    # Mode Change
+    master.set_mode('GUIDED')
+    
+    # Arm
+    master.mav.command_long_send(
+        master.target_system, master.target_component,
+        mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, 1, 0, 0, 0, 0, 0, 0
+    )
+    wait_for_arm(True)
+
+    # Takeoff
+    master.mav.command_long_send(
+        master.target_system, master.target_component,
+        mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0, 0, 0, 0, 0, 0, 0, altitude
+    )
+
+    # Watch altitude in the Post Office
+    while (drone_state["alt"] / 1000.0) < (altitude - 1.0):
+        print(f"Climbing... {drone_state['alt']/1000.0:.1f}m", end='\r')
+        time.sleep(0.2)
+    print("\nTarget Altitude Reached.")
+
+# --- 4. MAIN EXECUTION ---
 master = mavutil.mavlink_connection('udpin:0.0.0.0:14550')
-
-# HEARTBEAT CHECK: Script-drone communication pipeline check
 master.wait_heartbeat()
-print("Heartbeat Received! System is healthy.")
-last_heartbeat = time.time()
 
-# GPS: Store the starting position as "Home" for the Geofence
-msg = master.recv_match(type='GLOBAL_POSITION_INT', blocking=True)
-home_lat = msg.lat / 1e7
-home_lon = msg.lon / 1e7
-home_alt = msg.alt / 1000
-print(f"Home set to: {home_lat}, {home_lon}")
-
-def haversine_distance(lat1, lon1, lat2, lon2):
-    R = 6371000  # Radius of Earth in meters
-    p1, p2 = math.radians(lat1), math.radians(lat2)
-    l1, l2 = math.radians(lon1), math.radians(lon2)
-    dp, dl = p2 - p1, l2 - l1
-    a = math.sin(dp/2)**2 + math.cos(p1) * math.cos(p2) * math.sin(dl/2)**2
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
-    return R * c
-
-def set_home_location(master, lat, lon, alt):
-    # MAV_CMD_DO_SET_HOME (179)
-    master.mav.command_long_send(
-        master.target_system, master.target_component,
-        mavutil.mavlink.MAV_CMD_DO_SET_HOME,
-        0,    # Confirmation
-        0,    # Param 1: 1 = Use current, 0 = Use specified
-        0, 0, 0, # Unused params
-        lat, lon, alt # Target coordinates
-    )
-    print(f"Home location locked at: {lat}, {lon}")
-
-def take_off(master, altitude):
-    """
-    Automates the sequence: GUIDED Mode -> ARM -> TAKEOFF
-    """
-    print(f"Initiating Takeoff to {altitude}m...")
-
-    # 1. Ensure we are in GUIDED mode
-    # master.flightmode stores the current mode string
-    if master.flightmode != 'GUIDED':
-        print("Switching to GUIDED mode...")
-        master.set_mode('GUIDED')
-        # Wait for mode to change
-        while master.flightmode != 'GUIDED':
-            master.wait_heartbeat()
-            time.sleep(0.5)
-
-    # 2. ARM the motors
-    # MAV_CMD_COMPONENT_ARM_DISARM: param1=1 to arm, param1=0 to disarm
-    print("Arming motors...")
-    master.mav.command_long_send(
-        master.target_system, master.target_component,
-        mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
-        0, 1, 0, 0, 0, 0, 0, 0
-    )
-
-    # Wait for the drone to confirm it is armed
-    master.motors_armed_wait()
-    print("Armed!")
-
-    # 3. Send the TAKEOFF command
-    # MAV_CMD_NAV_TAKEOFF: Param 7 is altitude
-    print(f"Climbing to {altitude} meters...")
-    master.mav.command_long_send(
-        master.target_system, master.target_component,
-        mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
-        0, 0, 0, 0, 0, 0, 0, altitude
-    )
-
-
-# Set spawn point as home
-set_home_location(master, home_lat, home_lon, home_alt)
-
-'''
-def send_waypoint(master, lat, lon, alt):
-    master.mav.mission_item_int_send(
-        master.target_system, 
-        master.target_component,
-        0,                      # Sequence (not used for direct commands)
-        mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT, # Use altitude relative to home
-        mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,           # THE MESSAGE ID (16)
-        2,                      # Current (2 = Guided mode target)
-        0,                      # Autocontinue
-        0, 2, 0, 0,             # Params 1-4 (Hold time, radius, etc.)
-        int(lat * 1e7),         # Param 5: Latitude
-        int(lon * 1e7),         # Param 6: Longitude
-        alt                     # Param 7: Altitude
-    )
-    print(f"Sent Waypoint Packet: {lat}, {lon} at {alt}m")
-'''
-take_off(master, 15)
-
-# State machine flag
-breach_handled = False 
+# Start the Telemetry Thread
+t = threading.Thread(target=telemetry_reader, args=(master,), daemon=True)
+t.start()
 
 try:
+    take_off_safe(master, 15)
+    
     while True:
-        msg = master.recv_match(blocking=False)
-
-        # PROCESS MESSAGES (If they exist)
-        if msg:
-            msg_type = msg.get_type()
-            if msg_type == 'HEARTBEAT':
-                last_heartbeat = time.time()
-            elif msg_type == 'GLOBAL_POSITION_INT':
-                curr_lat, curr_lon = msg.lat / 1e7, msg.lon / 1e7
-                dist = haversine_distance(home_lat, home_lon, curr_lat, curr_lon)
-                # Keep these variables accessible outside this 'if msg' block
-                last_dist = dist
-                last_alt = msg.relative_alt
-
-        if time.time() - last_heartbeat > 3.0:
-            print("Heartbeat not detected: Commanding Emergency Land")
-            raise Exception("Heartbeat Timeout")
+        # Check Watchdog
+        if time.time() - drone_state["last_heartbeat"] > 3.0:
+            raise Exception(f"Heartbeat Lost! {time.time() - drone_state['last_heartbeat']:.2f}s")
         
-        # Get current mode from the heartbeat
-        current_mode = master.flightmode
-
-        print(f"Dist: {dist:.2f}m | Alt: {msg.relative_alt/1000:.1f}m | Mode: {current_mode}")
-
-        if time.time() - last_heartbeat > 3.0:
-            print("Heartbeat not detected: Commanding Emergency Land")
-            raise
-
-        # Geofence Logic
-        if dist > 30.0 and not breach_handled:
-            print("Geofence breach: Commanding RTL...")
-            master.set_mode('RTL')
-            breach_handled = True # Prevents re-sending the command
-            
-        # Monitor return
-        if breach_handled:
-            if current_mode == 'RTL':
-                if dist < 3.0 and msg.relative_alt < 500: # Within 2m and 0.5m alt
-                    print("Droned landed successfully.")
-                    break
-            else:
-                # If 5 seconds pass and we still aren't in RTL, then LAND
-                print("Waiting for RTL confirmation...")
-                time.sleep(1) 
-
-        time.sleep(0.5)
+        print(f"Telemetry: Alt={drone_state['alt']/1000.0:.1f}m | Mode={drone_state['mode']}", end='\r')
+        time.sleep(0.1)
 
 except Exception as e:
-    # HEARTBEAT/SIGNAL LOSS FAILSAFE
-    print(f"BCI Pipeline Error: {e}")
-    print("EMERGENCY: Loss of Control - Landing Drone...")
+    print(f"\n🛑 Pipeline Error: {e}")
+    drone_state["is_running"] = False
     master.set_mode('LAND')
