@@ -1,0 +1,6 @@
+
+cd ./DroneBridge_ESP32_v2_1_0_stable/esp32
+
+python3 -m esptool -p /dev/cu.usbserial-1110 erase_flash 
+
+python3 -m esptool --chip esp32 -p /dev/cu.usbserial-1110 -b 115200 --before default_reset --after hard_reset write_flash --flash_mode dio --flash_size 2MB --flash_freq 40m 0x1000 bootloader.bin 0x8000 partition-table.bin 0x10000 db_esp32.bin 0x190000 www.bin
