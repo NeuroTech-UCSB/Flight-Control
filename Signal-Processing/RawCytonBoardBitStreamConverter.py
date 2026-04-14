@@ -3,8 +3,27 @@
 #import sys
 import time
 import serial
+import collections
+import numpy as np
+import joblib
 from serial.tools import list_ports
-from EEGRawFilter import filter_sample_live
+from EEGRawFilter import filter_sample_live, extract_band_powers
+
+# ── Classifier config ──────────────────────────────────────────────────────────
+CLF_PATH   = "clf.pkl"          # path to saved joblib model from the notebook
+FS         = 250
+WIN_SAMPLES   = int(0.25 * FS)  # 62  — must match notebook (win_s = 0.25)
+STRIDE_SAMPLES = int(0.125 * FS) # 31  — must match notebook (stride_s = 0.125)
+CLENCH_THRESH  = 0.5            # probability threshold for a positive detection
+
+clf = joblib.load(CLF_PATH)
+window_buffer  = collections.deque(maxlen=WIN_SAMPLES)  # rolling (62, 8) buffer
+stride_counter = 0              # counts samples since last prediction
+clench_event_count = 0
+alpha_accumulator = []          # collects alpha means between 2s prints
+BAND_PRINT_INTERVAL = 2 * 250  # print averaged band power every 2 seconds
+band_sample_counter = 0        # counts samples since last band power print
+# ──────────────────────────────────────────────────────────────────────────────
 WARMUP_PACKETS = 100#250 * 16  # 16 seconds at 250 Hz
 START_BYTE = 0xA0
 STOP_BYTES = [0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC7, 0xC8, 0xC9, 0xCA, 0xCB, 0xCC, 0xCD, 0xCE, 0xCF]
@@ -60,6 +79,8 @@ while True:
             elif i == -1:
                 buffer.clear()
                 break
+            if len(buffer) < 33:
+                break
             if buffer[0] == 0xA0 and buffer[32] in STOP_BYTES:
                 packet = buffer[:33]
                 del buffer[:33]
@@ -88,16 +109,59 @@ while True:
                     EEG7.append(filtered[6])
                     EEG8.append(filtered[7])
                     validPackets.append(filtered)
-                    n = len(validPackets)
-                    print(f"\n{'─'*44}")
-                    print(f"  PKT #{n:>4}   (total received: {packets_received})")
-                    print(f"{'─'*44}")
-                    for ch, val in enumerate(filtered, 1):
-                        bar_len = int(min(abs(val), 100) / 100 * 20)
-                        bar = ('█' * bar_len).ljust(20)
-                        sign = '+' if val >= 0 else '-'
-                        print(f"  CH{ch}  {sign}{abs(val):>8.2f} µV  |{bar}|")
-                    print(f"{'─'*44}")
+                    if len(validPackets) % 250 == 0:  # print once per second
+                        print(f"  [{len(validPackets)} samples received — streaming OK]")
+
+                    # ── Windowed classifier ────────────────────────────────────
+                    # filtered is [ch0..ch7] — append as one (8,) row
+                    window_buffer.append(filtered)
+                    stride_counter += 1
+
+                    # Only predict once buffer is full AND a full stride has passed
+                    if len(window_buffer) == WIN_SAMPLES and stride_counter >= STRIDE_SAMPLES:
+                        stride_counter = 0
+
+                        # Shape: (62, 8) — axis=0 is time, axis=1 is channel
+                        # Matches notebook: X_windows[i] has shape (W, 8)
+                        Xw = np.array(window_buffer)            # (62, 8)
+                        # Features — identical to notebook Cell 3:
+                        #   rms = np.sqrt(np.mean(X_windows**2, axis=1))  → per notebook axis=1 over windows dim
+                        #   but for a single window axis=1 is channels, axis=0 is time
+                        #   notebook stacks windows so axis=1 becomes the time axis → same as axis=0 here
+                        rms = np.sqrt(np.mean(Xw ** 2, axis=0))  # (8,)
+                        var = np.var(Xw, axis=0)                  # (8,)
+                        f   = np.concatenate([rms, var]).reshape(1, -1)  # (1, 16)
+
+                        prob  = clf.predict_proba(f)[0, 1]
+                        t_now = packets_received / FS
+
+                        #if prob >= CLENCH_THRESH:
+                        #    clench_event_count += 1
+                        #    print(f"\n{'!'*50}")
+                        #    print(f"  JAW CLENCH #{clench_event_count}  |  t={t_now:.2f}s  |  prob={prob:.3f}")
+                        #    print(f"{'!'*50}\n")
+                        #else:
+                        #    print(f"  t={t_now:.2f}s  no clench  (prob={prob:.3f})")
+                        if prob >= CLENCH_THRESH:
+                            clench_event_count += 1
+                            #print(f"\n{'!'*50}")
+                            #print(f"  JAW CLENCH #{clench_event_count}  |  t={t_now:.2f}s  |  prob={prob:.3f}")
+                            #print(f"{'!'*50}\n")
+                        else:
+                            theta, alpha, beta = extract_band_powers(Xw)
+                            alpha_accumulator.append(alpha.mean())
+
+                    # Print averaged band power every 2 seconds
+                    band_sample_counter += 1
+                    if band_sample_counter >= BAND_PRINT_INTERVAL:
+                        band_sample_counter = 0
+                        if alpha_accumulator:
+                            avg_alpha = np.mean(alpha_accumulator)
+                            alpha_accumulator.clear()
+                            state = "RELAXED" if avg_alpha > 8 else "FOCUSED"
+                            print(f"  [2s avg]  {state}  (alpha={avg_alpha:.2f})")
+
+                    # ──────────────────────────────────────────────────────────
                 packets_received += 1
                 #if packets_received >= 1000:
                     #ser.write(b"s")
@@ -111,11 +175,11 @@ while True:
 
 print("Num of Valid Packets: ",  len(validPackets))
 
-print("EEG1: ", EEG1)
-print("EEG2: ", EEG2)
-print("EEG3: ", EEG3)
-print("EEG4: ", EEG4)
-print("EEG5: ", EEG5)
-print("EEG6: ", EEG6)
-print("EEG7: ", EEG7)
-print("EEG8: ", EEG8)
+#print("EEG1: ", EEG1)
+#print("EEG2: ", EEG2)
+#print("EEG3: ", EEG3)
+#print("EEG4: ", EEG4)
+#print("EEG5: ", EEG5)
+#print("EEG6: ", EEG6)
+#print("EEG7: ", EEG7)
+#print("EEG8: ", EEG8)
