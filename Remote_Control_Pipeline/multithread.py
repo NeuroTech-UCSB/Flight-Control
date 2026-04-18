@@ -26,8 +26,10 @@ class FlightState:
         self.alt = 0.0
         self.flightmode = "UNKNOWN"
         self.is_armed = False
+
         self.ekf_ready = False
         self.ready_to_fly = False
+        self.onboard_control_sensors_health = 0
 
         # Navigation / Home Data (Initialized to None until EKF is ready)
         self.home_lat = None
@@ -91,14 +93,20 @@ def telemetry_thread(master, state):
                 # Update Extended Kalmen Filter (EKF) status
                 elif m_type == 'SYS_STATUS':
                     # 0x400000 is the bitmask for EKF/Positioning active
-                    #print("received sys_status")
+                    state.onboard_control_sensors_health = msg.onboard_control_sensors_health
+
                     if msg.onboard_control_sensors_health & 0x400000:
                         state.ekf_ready = True
                         state.ready_to_fly = True
                     else:
+                        print(msg.onboard_control_sensors_health)
                         state.ekf_ready = False
                         state.ready_to_fly = False
                 
+                elif m_type == 'EKF_STATUS_REPORT':
+                    print("received EKF_STATUS_REPORT")
+                    print(msg.flags)
+
                 # Update mission and command acks
                 elif m_type == 'MISSION_ACK':
                     state.mission_ack_received = True
@@ -333,6 +341,13 @@ def main():
         mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, 0,
         mavutil.mavlink.MAVLINK_MSG_ID_STATUSTEXT,
         0, 0, 0, 0, 0, 0 # Interval at 0 means default stream rate
+    )
+
+    master.mav.command_long_send(
+        master.target_system, master.target_component,
+        mavutil.mavlink.MAV_CMD_REQUEST_MESSAGE, 0,
+        mavutil.mavlink.MAVLINK_MSG_ID_EKF_STATUS_REPORT,
+        0, 0, 0, 0, 0, 0
     )
 
     # Start the Background Threads
