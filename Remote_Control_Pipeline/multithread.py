@@ -18,12 +18,16 @@ class FlightState:
         
         # Telemetry Data
         self.last_heartbeat = time.time()
+
+        self.last_gcs_heartbeat_sent = 0.0
+
         self.lat = 0.0
         self.lon = 0.0
         self.alt = 0.0
         self.flightmode = "UNKNOWN"
         self.is_armed = False
         self.ekf_ready = False
+        self.ready_to_fly = False
 
         # Navigation / Home Data (Initialized to None until EKF is ready)
         self.home_lat = None
@@ -35,7 +39,7 @@ class FlightState:
         self.command_ack = None # Will store a tuple: (command_id, result)
         
         # Sensor Data
-        self.bci_command = "STANDBY" # Variable stub
+        self.user_command = "STANDBY" # Variable stub
         
         # Safety Flags
         self.geofence_breached = False
@@ -87,8 +91,13 @@ def telemetry_thread(master, state):
                 # Update Extended Kalmen Filter (EKF) status
                 elif m_type == 'SYS_STATUS':
                     # 0x400000 is the bitmask for EKF/Positioning active
-                    if msg.onboard_control_sensors_present & 0x400000:
+                    #print("received sys_status")
+                    if msg.onboard_control_sensors_health & 0x400000:
                         state.ekf_ready = True
+                        state.ready_to_fly = True
+                    else:
+                        state.ekf_ready = False
+                        state.ready_to_fly = False
                 
                 # Update mission and command acks
                 elif m_type == 'MISSION_ACK':
@@ -97,6 +106,20 @@ def telemetry_thread(master, state):
                 elif m_type == 'COMMAND_ACK':
                     state.command_ack = (msg.command, msg.result) # (command_id, result)
         
+                # Catch critical system messages (e.g., pre-arm failures, errors, warnings)
+                elif m_type == 'STATUSTEXT':
+                    text = msg.text
+                    severity = msg.severity
+                    # Severity levels: 0=EMERGENCY, 1=ALERT, 2=CRITICAL, 3=ERROR, 4=WARNING, 5=NOTICE, 6=INFO, 7=DEBUG
+                    # We print INFO and above (<= 6) to catch typical QGroundControl status texts
+                    if severity <= 6:
+                        # Clear current line if we are doing inline printing elsewhere
+                        print(f"\n[SYS_MSG] {text}")
+                else:
+                    #print(f"m_type: {m_type}")
+                    pass 
+
+
         # 3. Active Checks
         with state.lock:
             hb_gap = time.time() - state.last_heartbeat
@@ -105,6 +128,18 @@ def telemetry_thread(master, state):
             h_lat, h_lon = state.home_lat, state.home_lon
             breached = state.geofence_breached
             range = state.geofence_range
+
+        # Send GCS Heartbeat (~1 Hz) to prevent GCS failsafe
+        current_time = time.time()
+        if (current_time - state.last_gcs_heartbeat_sent) >= 1.0:
+            master.mav.heartbeat_send(
+                mavutil.mavlink.MAV_TYPE_GCS,
+                mavutil.mavlink.MAV_AUTOPILOT_INVALID,
+                0, 0, 0
+            )
+            with state.lock:
+                state.last_gcs_heartbeat_sent = current_time
+            
             
         # Active Watch 1: Heartbeat
         if hb_gap > 5.0:
@@ -133,11 +168,29 @@ def bci_thread(state):
         time.sleep(0.2) 
         
         # Placeholder for actual BCI SDK logic
-        simulated_reading = "STANDBY" 
         
+
+        #use keyboard input for now
+        user_cmd = input(">>")
+        user_cmd = user_cmd.lower()
+
+        cmd = state.user_command
+        if user_cmd == "h" or user_cmd == "help":
+            print("Enter Up/U to command the drone to hover or Down/D to land")
+            continue
+        elif user_cmd == "u" or user_cmd == "up":
+            cmd = "HOVER"
+        elif user_cmd == "d" or user_cmd == "down":
+            cmd = "LAND"
+        else:
+            cmd = state.user_command #keep last state
+            print(f"Unknown command, keeping current state: {state.user_command}")
+
+        # ====================================== STATE UPDATE ==========================
         # Safely update the shared state
         with state.lock:
-            state.bci_command = simulated_reading
+            state.user_command = cmd
+            print(f"Set state.user_command: {state.user_command}")
 
 # ==========================================
 # 5. Flight Primitives
@@ -256,6 +309,12 @@ def land(master, state, rtl=False):
             
         time.sleep(0.2)
 
+
+def print_telemetry(state):
+    # Telemetry Output
+    print(f"Alt: {state.alt:.1f}m | Mode: {state.flightmode} | USER COMMAND: {state.user_command}", end='\r')
+    time.sleep(0.1)
+
 # ==========================================
 # 6. Thread 3: Mission (Main Loop)
 # ==========================================
@@ -268,6 +327,14 @@ def main():
     master.wait_heartbeat() # Waits till heartbeat connects before proceeding
     print("Heartbeat Connected.")
 
+    # Request STATUSTEXT messages
+    master.mav.command_long_send(
+        master.target_system, master.target_component,
+        mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, 0,
+        mavutil.mavlink.MAVLINK_MSG_ID_STATUSTEXT,
+        0, 0, 0, 0, 0, 0 # Interval at 0 means default stream rate
+    )
+
     # Start the Background Threads
     # 'daemon=True' ensures threads will automatically terminate when  main script ends
     t_telem = threading.Thread(target=telemetry_thread, args=(master, state,), daemon=True)
@@ -279,10 +346,16 @@ def main():
 
     # Wait for initial GPS lock via the background thread
     print("Waiting for EKF/GPS Readiness...")
+    time.sleep(0.1) #wait for state data to arrive
     while True:
+        print_telemetry(state)
+
         with state.lock:
             if state.ekf_ready: break
-        time.sleep(1)
+        time.sleep(10)
+        print("EKF not ready")
+        time.sleep(0.1)
+
     print("System Ready for Flight.")
 
     with state.lock:
@@ -292,10 +365,19 @@ def main():
         
     # set_home(master, home_lat, home_lon, home_alt)
 
+    #TODO: Remove
     try:
+        #Safety
+        while True:
+            print("spinning in while loop")
+            time.sleep(2)
+
         # --- MISSION START ---
         take_off(master, state, 10.0)
-        nav_waypoint(master, state, home_lat + 0.0001, home_lon + 0.0001, 10.0)
+        
+        #nav_waypoint(master, state, home_lat + 0.0001, home_lon + 0.0001, 10.0)
+        nav_waypoint(master, state, home_lat, home_lon, 10.0)
+
         land(master, state, rtl=True)
 
         print("\nMission Complete. Entering Monitor Mode. Press Ctrl+C to Land.")
@@ -305,7 +387,7 @@ def main():
             dist = haversine_distance(home_lat, home_lon, state.lat, state.lon)
         
             # Telemetry Output
-            print(f"Dist: {dist:.1f}m | Alt: {state.alt:.1f}m | Mode: {state.flightmode} | BCI: {state.bci_command}", end='\r')
+            print(f"Dist: {dist:.1f}m | Alt: {state.alt:.1f}m | Mode: {state.flightmode} | USER COMMAND: {state.user_command}", end='\r')
             time.sleep(0.1)
 
     except KeyboardInterrupt:
