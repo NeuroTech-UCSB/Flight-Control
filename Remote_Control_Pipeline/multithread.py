@@ -28,8 +28,11 @@ class FlightState:
         self.is_armed = False
 
         self.ekf_ready = False
-        self.ready_to_fly = False
+        self.rc_found = False
+        self.ready_to_fly = False 
+
         self.onboard_control_sensors_health = 0
+        self.voltage_battery = 0
 
         # Navigation / Home Data (Initialized to None until EKF is ready)
         self.home_lat = None
@@ -68,6 +71,7 @@ def haversine_distance(lat1, lon1, lat2, lon2):
 # ==========================================
 def telemetry_thread(master, state):
     """Runs continuously in the background at ~100Hz. Non-blocking process."""
+    last_telem_time = time.time()
     while True:
         # 1. Receive packet (Non-Blocking)
         msg = master.recv_match(blocking=False)
@@ -90,22 +94,58 @@ def telemetry_thread(master, state):
                     state.flightmode = master.flightmode
                     state.is_armed = master.motors_armed()
 
-                # Update Extended Kalmen Filter (EKF) status
+                # Update ready to fly status
                 elif m_type == 'SYS_STATUS':
                     # 0x400000 is the bitmask for EKF/Positioning active
                     state.onboard_control_sensors_health = msg.onboard_control_sensors_health
+                    state.voltage_battery = msg.voltage_battery
 
-                    if msg.onboard_control_sensors_health & 0x400000:
-                        state.ekf_ready = True
+                    #print(state.onboard_control_sensors_health)
+                    if (state.onboard_control_sensors_health & mavutil.mavlink.MAV_SYS_STATUS_PREARM_CHECK):
+                        if (not state.ready_to_fly):
+                            print("System sensors healthy, ready to fly")
                         state.ready_to_fly = True
+
+
+                elif m_type == 'RC_CHANNELS':
+                    #print("Rc_channels")
+                    if msg.chancount == 0: 
+                        print("Not receiving any rc channels, please check receiver and transmitter are enabled")
+                    elif msg.chancount < 6:
+                        print("Not receiving enough channels for safe flight operation")
                     else:
-                        print(msg.onboard_control_sensors_health)
-                        state.ekf_ready = False
-                        state.ready_to_fly = False
-                
+                        if (not state.rc_found):
+                            print("RC receiving channels")    
+                        state.rc_found = True
+
+                #Extended Kalman Filter Status
                 elif m_type == 'EKF_STATUS_REPORT':
-                    print("received EKF_STATUS_REPORT")
-                    print(msg.flags)
+                    #print("received EKF_STATUS_REPORT")
+                    # Check if EKF has valid attitude, velocity, and absolute position
+                    ekf_healthy = (
+                        (msg.flags & mavutil.mavlink.EKF_ATTITUDE) and
+                        (msg.flags & mavutil.mavlink.EKF_VELOCITY_HORIZ) and
+                        (msg.flags & mavutil.mavlink.EKF_VELOCITY_VERT) and
+                        (msg.flags & mavutil.mavlink.EKF_POS_HORIZ_ABS) and
+                        (msg.flags & mavutil.mavlink.EKF_POS_VERT_ABS) and
+                        (msg.flags & mavutil.mavlink.EKF_PRED_POS_HORIZ_ABS)
+                    )
+                    #print("EKF status",ekf_healthy)
+
+                    if (msg.flags & mavutil.mavlink.EKF_UNINITIALIZED):
+                        print("EKF uninitialized")
+                    elif (msg.flags & mavutil.mavlink.EKF_GPS_GLITCHING):
+                        print("EKF thinks GPS is unhealthy")
+                        state.ekf_ready = False
+
+                    elif ekf_healthy:
+                        if (not state.ekf_ready):
+                            print(f"Set EKF Ready {msg.flags}")
+                        state.ekf_ready = True
+                    else:
+                        state.ekf_ready = False
+
+                    #print(msg.flags)
 
                 # Update mission and command acks
                 elif m_type == 'MISSION_ACK':
@@ -127,7 +167,6 @@ def telemetry_thread(master, state):
                     #print(f"m_type: {m_type}")
                     pass 
 
-
         # 3. Active Checks
         with state.lock:
             hb_gap = time.time() - state.last_heartbeat
@@ -139,7 +178,7 @@ def telemetry_thread(master, state):
 
         # Send GCS Heartbeat (~1 Hz) to prevent GCS failsafe
         current_time = time.time()
-        if (current_time - state.last_gcs_heartbeat_sent) >= 1.0:
+        if (current_time - state.last_gcs_heartbeat_sent) >= 0.5:
             master.mav.heartbeat_send(
                 mavutil.mavlink.MAV_TYPE_GCS,
                 mavutil.mavlink.MAV_AUTOPILOT_INVALID,
@@ -163,9 +202,12 @@ def telemetry_thread(master, state):
                 with state.lock:
                     state.geofence_breached = True
 
-        time.sleep(0.01) # Yield
- 
+        if (time.time() - last_telem_time > 5):
+            last_telem_time = time.time()
+            print_telemetry(state)
 
+        time.sleep(0.01) # Yield
+        
 # ==========================================
 # 4. Thread 2: BCI Sensor (Stub)
 # ==========================================
@@ -217,6 +259,26 @@ def set_home(master, state, lat, lon, alt=0):
     # Time for EKF to register new origin
     time.sleep(0.5)
 
+def wait_for_arming(master,state):
+    # 2. Check/Set Arming
+    with state.lock:
+        armed = state.is_armed
+        
+    while not state.is_armed:
+        with state.lock:
+            armed = state.is_armed
+        print("Please ARM with RC Arming switch")
+        time.sleep(5)
+        #master.mav.command_long_send(
+        #    master.target_system, master.target_component,
+        #    mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, 1, 0, 0, 0, 0, 0, 0
+        #)
+        #while True: # Blocking loop while motors aren't armed
+        #    with state.lock:
+        #        if state.is_armed: break
+        #    time.sleep(0.1)
+    print("Motors armed")
+
 def prep_flight(master, state):
     """Safely transitions to GUIDED mode and ARMs the motors."""
     print("Pre-Flight Checks Initiated...")
@@ -225,35 +287,23 @@ def prep_flight(master, state):
     with state.lock:
         current_mode = state.flightmode
         
+    wait_for_arming(master,state)
+
+    #wait for RC to enable guided mode
     if current_mode != 'GUIDED':
-        print("Switching to GUIDED mode...")
-        master.set_mode('GUIDED')
+        #master.set_mode('GUIDED')
         while True:
+            print("Please switch to GUIDED mode with RC switch")
             with state.lock:
                 if state.flightmode == 'GUIDED': break
-            time.sleep(0.1)
+            time.sleep(5)
 
-    # 2. Check/Set Arming
-    with state.lock:
-        armed = state.is_armed
-        
-    if not armed:
-        print("Arming Motors...")
-        master.mav.command_long_send(
-            master.target_system, master.target_component,
-            mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, 1, 0, 0, 0, 0, 0, 0
-        )
-        while True: # Blocking loop while motors aren't armed
-            with state.lock:
-                if state.is_armed: break
-            time.sleep(0.1)
-    
+    print("In guided mode")
     time.sleep(1)
     print("Pre-Flight Complete.")
 
 def take_off(master, state, target_alt):
-    """Initiates flight prep and takeoff to desired altitude"""
-    prep_flight(master, state)
+    """takeoff to desired altitude"""
     print(f"Climbing to {target_alt} meters...")
     master.mav.command_long_send(
         master.target_system, master.target_component,
@@ -264,7 +314,7 @@ def take_off(master, state, target_alt):
         with state.lock:
             curr_alt = state.alt
             
-        print(f"Takeoff Alt: {curr_alt:.1f}m", end='\r')
+        print(f"Current Alt: {curr_alt:.1f}m", end='\r')
         if curr_alt >= (target_alt - 1.0): # 1m buffer
             print(f"\nTakeoff Complete.")
             break
@@ -320,12 +370,30 @@ def land(master, state, rtl=False):
 
 def print_telemetry(state):
     # Telemetry Output
-    print(f"Alt: {state.alt:.1f}m | Mode: {state.flightmode} | USER COMMAND: {state.user_command}", end='\r')
+    print(f"Alt: {state.alt:.1f}m | Mode: {state.flightmode} | USER COMMAND: {state.user_command} | BATTERY: {state.voltage_battery}",  end='\r')
     time.sleep(0.1)
 
 # ==========================================
 # 6. Thread 3: Mission (Main Loop)
 # ==========================================
+def mission_plan(master,state):
+    prep_flight(master, state)
+
+    #return
+    take_off(master, state, 2) #take off to two meters
+        
+    delay = 5
+    last = time.time()
+    while (time.time()- last < delay):
+        print('waiting 1 second at waypoint')
+        time.sleep(1)
+    print("landing")
+    #nav_waypoint(master, state, home_lat + 0.0001, home_lon + 0.0001, 10.0)
+    #nav_waypoint(master, state, home_lat, home_lon, 10.0)
+
+    land(master, state, rtl=True)
+
+
 def main():
     # Instantiate the global state tracker FlightState object
     state = FlightState()
@@ -350,6 +418,20 @@ def main():
         0, 0, 0, 0, 0, 0
     )
 
+    master.mav.command_long_send(
+        master.target_system, master.target_component,
+        mavutil.mavlink.MAV_CMD_REQUEST_MESSAGE, 0,
+        mavutil.mavlink.MAVLINK_MSG_ID_RC_CHANNELS,
+        0, 0, 0, 0, 0, 0
+    )
+
+    master.mav.command_long_send(
+        master.target_system, master.target_component,
+        mavutil.mavlink.MAV_CMD_REQUEST_MESSAGE, 0,
+        mavutil.mavlink.MAVLINK_MSG_ID_SYS_STATUS,
+        0, 0, 0, 0, 0, 0
+    )
+
     # Start the Background Threads
     # 'daemon=True' ensures threads will automatically terminate when  main script ends
     t_telem = threading.Thread(target=telemetry_thread, args=(master, state,), daemon=True)
@@ -360,15 +442,21 @@ def main():
     print("Background Threads Running: Telemetry [ON], BCI [ON]")
 
     # Wait for initial GPS lock via the background thread
-    print("Waiting for EKF/GPS Readiness...")
-    time.sleep(0.1) #wait for state data to arrive
+    print("Waiting for EKF/GPS Readiness and RC connection")
+    time.sleep(1) #wait for state data to arrive
     while True:
         print_telemetry(state)
 
         with state.lock:
-            if state.ekf_ready: break
+            if state.ready_to_fly: break 
+            #if state.ekf_ready and state.rc_found: break
+            print("not ready to fly")
         time.sleep(10)
-        print("EKF not ready")
+
+        if not state.ekf_ready:
+            print("EKF not ready")
+        if not state.rc_found:
+            print("No RC found")
         time.sleep(0.1)
 
     print("System Ready for Flight.")
@@ -383,17 +471,13 @@ def main():
     #TODO: Remove
     try:
         #Safety
-        while True:
-            print("spinning in while loop")
-            time.sleep(2)
+        #while True:
+        #    print("spinning in while loop")
+        #    time.sleep(2)
 
         # --- MISSION START ---
-        take_off(master, state, 10.0)
-        
-        #nav_waypoint(master, state, home_lat + 0.0001, home_lon + 0.0001, 10.0)
-        nav_waypoint(master, state, home_lat, home_lon, 10.0)
-
-        land(master, state, rtl=True)
+        #prep_flight(master,state)
+        mission_plan(master,state)
 
         print("\nMission Complete. Entering Monitor Mode. Press Ctrl+C to Land.")
         
@@ -402,7 +486,8 @@ def main():
             dist = haversine_distance(home_lat, home_lon, state.lat, state.lon)
         
             # Telemetry Output
-            print(f"Dist: {dist:.1f}m | Alt: {state.alt:.1f}m | Mode: {state.flightmode} | USER COMMAND: {state.user_command}", end='\r')
+            print(f"Dist: {dist:.1f}m")
+            print_telemetry(state)
             time.sleep(0.1)
 
     except KeyboardInterrupt:
