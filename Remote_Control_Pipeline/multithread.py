@@ -4,7 +4,7 @@ import time
 import threading
 import os
 
-from RawCytonBoardBitStreamConverter import process_bci, init_bci
+from bci import process_bci, init_bci
 # ==========================================
 # 1. Class of Shared States & Flags
 # ==========================================
@@ -46,6 +46,8 @@ class FlightState:
         
         # Sensor Data
         self.user_command = "STANDBY" # Variable stub
+        self.bci_command = None
+        self.use_bci = False
         
         # Safety Flags
         self.geofence_breached = False
@@ -212,44 +214,63 @@ def telemetry_thread(master, state):
 # ==========================================
 # 4. Thread 2: BCI Sensor (Stub)
 # ==========================================
+def user_input_thread(state):
+    #use keyboard input for stability
+    print("Started User Shell:")
+    while True:
+        user_cmd = input(">>")
+        user_cmd = user_cmd.lower()
+
+        prev_cmd = state.user_command
+        if user_cmd == "h" or user_cmd == "help":
+            print("Enter Up/U to command the drone to hover or Down/D to land")
+            continue
+
+        elif user_cmd == "u" or user_cmd == "up":
+            if state.use_bci:
+                print("Using BCI mode, can only command LAND (enter d or down)")
+            with state.lock:
+                state.user_command = "HOVER"
+
+        elif user_cmd == "d" or user_cmd == "down":
+            with state.lock:
+                state.user_command = "LAND"
+
+        elif user_cmd == "b" or user_cmd == "bci":
+            with state.lock:
+                state.use_bci = True
+
+        elif user_cmd == "nb" or user_cmd == "nobci":
+            with state.lock:
+                state.use_bci = False
+        else:
+            state.user_command = prev_cmd #keep last state
+            print(f"Unknown command, keeping current user input: {state.user_command}")
+
+        #state.previous_user_command = cmd 
+
 def bci_thread(state):
     """Simulates reading incoming brainwave/eye-tracking data asynchronously."""
 
-
-    prev_bci_command = None
+    prev_event = None
     while True:
         # Simulate processing time for an EEG/Eye-Tracker frame (e.g., 200ms)
         time.sleep(0.2) 
         
         # Placeholder for actual BCI SDK logic
-        bci_command = process_bci()
-        if (bci_command != prev_bci_command):
-            print(f"New BCI Event: {bci_command}")
-            prev_bci_command = bci_command
+        event = process_bci()
+        if (event is not None and event != prev_event):
+            print(f"New BCI Event: {event}")
+            prev_event = event
 
-
-
-        #use keyboard input for stability
-        user_cmd = input(">>")
-        user_cmd = user_cmd.lower()
-
-        cmd = state.user_command
-        if user_cmd == "h" or user_cmd == "help":
-            print("Enter Up/U to command the drone to hover or Down/D to land")
-            continue
-        elif user_cmd == "u" or user_cmd == "up":
-            cmd = "HOVER"
-        elif user_cmd == "d" or user_cmd == "down":
-            cmd = "LAND"
-        else:
-            cmd = state.user_command #keep last state
-            print(f"Unknown command, keeping current state: {state.user_command}")
-
-        # ====================================== STATE UPDATE ==========================
-        # Safely update the shared state
-        with state.lock:
-            state.user_command = cmd
-            print(f"Set state.user_command: {state.user_command}")
+            if (event == "RELAXED"):
+                with state.lock:
+                    state.bci_command = "LAND"
+            elif (event == "FOCUSED"):
+                with state.lock:
+                    state.bci_command = "HOVER"
+            else:
+                print(f"====Unhandled BCI event {event}====")
 
 # ==========================================
 # 5. Flight Primitives
@@ -321,7 +342,7 @@ def take_off(master, state, target_alt):
     # 1. Check/Set Mode
     with state.lock:
         current_mode = state.flightmode
-        
+
     if current_mode != 'GUIDED':
         master.set_mode('GUIDED')
         while True:
@@ -417,11 +438,36 @@ def test_mission_plan(master,state):
 
     land(master, state, rtl=True)
 
-def demo_mission(master,state):
+def bci_mission(master,state):
     #prep_flight(master,state)
 
     #TODO: Move this logic into a safer state machine
-    #state.user_command_completed = False 
+    state.prev_command = "STANDBY"
+    while True:
+
+        command_hover = (state.use_bci and state.bci_command == "HOVER") or (not state.use_bci and state.user_command == "HOVER")
+        command_land =  (state.use_bci and state.bci_command == "LAND") or (not state.use_bci and state.user_command == "LAND")
+
+        if command_hover:
+            if "HOVER" != state.prev_command:
+                print("Hovering hehe")
+
+                state.prev_command = "HOVER"
+                #take_off(master,state,2)
+            
+        elif command_land:
+            if "LAND" != state.prev_command:
+                print("not Hovering hehe")
+
+                state.prev_command = "LAND"
+                #land(master,state,2)
+
+        else:
+            pass
+
+#listens only to user input
+def demo_mission(master,state):
+
     state.prev_command = "STANDBY"
     while True:
         if state.user_command == "HOVER":
@@ -437,11 +483,10 @@ def demo_mission(master,state):
                 state.prev_command = state.user_command
                 land(master,state,2)
 
-
 def main():
 
     #connecting to the BCI headset:
-    #init_bci() #opens a serial connection to the BCI device
+    init_bci() #opens a serial connection to the BCI device
 
 
     # Instantiate the global state tracker FlightState object
@@ -451,7 +496,6 @@ def main():
     master = mavutil.mavlink_connection('udpin:0.0.0.0:14550')
     master.wait_heartbeat() # Waits till heartbeat connects before proceeding
     print("Heartbeat Connected.")
-
 
 
     # Request STATUSTEXT messages
@@ -487,10 +531,14 @@ def main():
     # 'daemon=True' ensures threads will automatically terminate when  main script ends
     t_telem = threading.Thread(target=telemetry_thread, args=(master, state,), daemon=True)
     t_bci = threading.Thread(target=bci_thread, args=(state,), daemon=True)
-    
+    t_user = threading.Thread(target=user_input_thread, args=(state,), daemon = True)
+   
     t_telem.start()
     t_bci.start()
-    print("Background Threads Running: Telemetry [ON], BCI [ON]")
+    t_user.start()
+    
+    #handles drone state transitions based on user and BCI input
+    print("Background Threads Running: Telemetry [ON], BCI [ON], USER INPUT [ON]")
 
     # Wait for initial GPS lock via the background thread
     print("Waiting for EKF/GPS Readiness and RC connection")
@@ -529,7 +577,8 @@ def main():
 
         # --- MISSION START ---
         #prep_flight(master,state)
-        demo_mission(master,state)
+        #demo_mission(master,state)
+        bci_mission(master,state)
 
         print("\nMission Complete. Entering Monitor Mode. Press Ctrl+C to Land.")
         

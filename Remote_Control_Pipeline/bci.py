@@ -30,6 +30,7 @@ STOP_BYTES = [0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC7, 0xC8, 0xC9, 0xCA, 
 
 ser = None
 def init_bci():
+    global ser
     ## CHECKING FOR AVAILABLE SERIAL PORTS - DEBUGGING PURPOSES 
     for port in list_ports.comports():
         print(port.device)
@@ -43,6 +44,10 @@ def init_bci():
     ser.write(b"v")
     time.sleep(0.5)
     ser.write(b"b")
+
+    print(ser)
+
+    print("connecting to BCI headset...")
     ## END OF CYTON BOARD SERIAL CONNECTION
 
 ## HELPER FUNCTION TO CONVERT 24-BIT SIGNED INTEGER TO 3 BYTES
@@ -51,6 +56,12 @@ def int24_to_bytes(value):
     if value < 0:
         value += 1 << 24
     return value.to_bytes(3, byteorder='big')
+
+
+#filtering variables
+state_history = ["RELAXED"] * 9
+current_state = "RELAXED"
+history_threshold = 7
 
 
 ## MAIN LOOP TO READ FROM SERIAL PORT AND PROCESS PACKETS
@@ -67,10 +78,21 @@ EEG7 = []
 EEG8 = []
 packets_received = 0
 def process_bci():
+    global current_state
+    global packets_received
+    global stride_counter
+    global window_buffer
+    global band_sample_counter
+    global clench_event_count
     #while True:
-    if ser is None or ser.is_open == False:
+   #print(ser)
+    if ser is None:
         print("No serial port found for openBCI device")
         return
+    if ser.is_open == False:
+        print("OpenBCI Serial port not open")
+        return
+
     
     n = ser.in_waiting; chunk = ser.read(n or 1)
     #print(f"Read {len(chunk)} bytes: {chunk.hex()}")
@@ -165,8 +187,32 @@ def process_bci():
                         if alpha_accumulator:
                             avg_alpha = np.mean(alpha_accumulator)
                             alpha_accumulator.clear()
-                            state = "RELAXED" if avg_alpha > 8 else "FOCUSED"
-                            print(f"  [2s avg]  {state}  (alpha={avg_alpha:.2f})")
+                            sampled_state = "RELAXED" if avg_alpha > 8 else "FOCUSED"
+                            
+                            #create a moving average
+                            for i in range(len(state_history)-1):
+                                state_history[i+1] = state_history[i]
+                            state_history[0] = sampled_state
+
+                            #switch current state
+                            if current_state != "RELAXED" and current_state != "FOCUSED":
+                                print(f"current_state: {current_state}")
+                                raise ValueError("variable current_state is not RELAXED or FOCUSED")
+
+                            if current_state == "RELAXED" and state_history.count("FOCUSED") > history_threshold:
+                                current_state = "FOCUSED"
+                                print("set focused")
+                            elif current_state == "FOCUSED" and state_history.count("RELAXED") > history_threshold:
+                                current_state = "RELAXED"
+                                print("set relaxed")
+                            
+                            print(f"  [2s avg]  {sampled_state}  (alpha={avg_alpha:.2f})")
+                            #print(state_history)
+                            print(current_state)
+                            relaxed_count = state_history.count('RELAXED')
+                            print(f"# relaxed: {relaxed_count}")
+
+                            return current_state
 
                     # ──────────────────────────────────────────────────────────
                 packets_received += 1

@@ -49,6 +49,10 @@ def int24_to_bytes(value):
         value += 1 << 24
     return value.to_bytes(3, byteorder='big')
 
+state_history = ["RELAXED"] * 9
+current_state = "RELAXED"
+history_threshold = 7
+
 ## MAIN LOOP TO READ FROM SERIAL PORT AND PROCESS PACKETS
 buffer = bytearray()
 SCALE_UV = (4.5 / (24 * (2**23 - 1))) * 1e6
@@ -159,7 +163,29 @@ while True:
                             avg_alpha = np.mean(alpha_accumulator)
                             alpha_accumulator.clear()
                             state = "RELAXED" if avg_alpha > 8 else "FOCUSED"
+
+                            #create a moving average
+                            for i in range(len(state_history)-1):
+                                state_history[i+1] = state_history[i]
+                            state_history[0] = state
+
+                            #switch current state
+                            if current_state != "RELAXED" and current_state != "FOCUSED":
+                                print(f"current_state: {current_state}")
+                                raise ValueError("variable current_state is not RELAXED or FOCUSED")
+
+                            if current_state == "RELAXED" and state_history.count("FOCUSED") > history_threshold:
+                                current_state = "FOCUSED"
+                                print("set focused")
+                            elif current_state == "FOCUSED" and state_history.count("RELAXED") > history_threshold:
+                                current_state = "RELAXED"
+                                print("set relaxed")
+                            
                             print(f"  [2s avg]  {state}  (alpha={avg_alpha:.2f})")
+                            #print(state_history)
+                            print(current_state)
+                            relaxed_count = state_history.count('RELAXED')
+                            print(f"# relaxed: {relaxed_count}")
 
                     # ──────────────────────────────────────────────────────────
                 packets_received += 1
