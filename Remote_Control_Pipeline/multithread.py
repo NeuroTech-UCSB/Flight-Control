@@ -4,6 +4,7 @@ import time
 import threading
 import os
 
+from RawCytonBoardBitStreamConverter import process_bci, init_bci
 # ==========================================
 # 1. Class of Shared States & Flags
 # ==========================================
@@ -213,14 +214,22 @@ def telemetry_thread(master, state):
 # ==========================================
 def bci_thread(state):
     """Simulates reading incoming brainwave/eye-tracking data asynchronously."""
+
+
+    prev_bci_command = None
     while True:
         # Simulate processing time for an EEG/Eye-Tracker frame (e.g., 200ms)
         time.sleep(0.2) 
         
         # Placeholder for actual BCI SDK logic
-        
+        bci_command = process_bci()
+        if (bci_command != prev_bci_command):
+            print(f"New BCI Event: {bci_command}")
+            prev_bci_command = bci_command
 
-        #use keyboard input for now
+
+
+        #use keyboard input for stability
         user_cmd = input(">>")
         user_cmd = user_cmd.lower()
 
@@ -280,35 +289,50 @@ def wait_for_arming(master,state):
     print("Motors armed")
 
 def prep_flight(master, state):
-    """Safely transitions to GUIDED mode and ARMs the motors."""
+    """Waits for user to arme motors."""
     print("Pre-Flight Checks Initiated...")
     
-    # 1. Check/Set Mode
-    with state.lock:
-        current_mode = state.flightmode
+    
         
     wait_for_arming(master,state)
 
     #wait for RC to enable guided mode
-    if current_mode != 'GUIDED':
+    #if current_mode != 'GUIDED':
         #master.set_mode('GUIDED')
-        while True:
-            print("Please switch to GUIDED mode with RC switch")
-            with state.lock:
-                if state.flightmode == 'GUIDED': break
-            time.sleep(5)
+    #    while True:
+            #print("Please switch to GUIDED mode with RC switch")
+    #        with state.lock:
+    #            if state.flightmode == 'GUIDED': break
+    #        time.sleep(5)
 
-    print("In guided mode")
+    #print("In guided mode")
     time.sleep(1)
     print("Pre-Flight Complete.")
 
-def take_off(master, state, target_alt):
-    """takeoff to desired altitude"""
+def send_takeoff_command(master,state,target_alt):
     print(f"Climbing to {target_alt} meters...")
     master.mav.command_long_send(
         master.target_system, master.target_component,
         mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0, 0, 0, 0, 0, 0, 0, target_alt
     )
+
+def take_off(master, state, target_alt):
+
+    # 1. Check/Set Mode
+    with state.lock:
+        current_mode = state.flightmode
+        
+    if current_mode != 'GUIDED':
+        master.set_mode('GUIDED')
+        while True:
+            #print("Please switch to GUIDED mode with RC switch")
+            with state.lock:
+                if state.flightmode == 'GUIDED': break
+            print("Waiting for autopilot to switch to guided mode")
+            time.sleep(5)
+
+    """takeoff to desired altitude"""
+    send_takeoff_command(master,state,target_alt)
 
     while True:
         with state.lock:
@@ -376,7 +400,7 @@ def print_telemetry(state):
 # ==========================================
 # 6. Thread 3: Mission (Main Loop)
 # ==========================================
-def mission_plan(master,state):
+def test_mission_plan(master,state):
     prep_flight(master, state)
 
     #return
@@ -393,8 +417,33 @@ def mission_plan(master,state):
 
     land(master, state, rtl=True)
 
+def demo_mission(master,state):
+    #prep_flight(master,state)
+
+    #TODO: Move this logic into a safer state machine
+    #state.user_command_completed = False 
+    state.prev_command = "STANDBY"
+    while True:
+        if state.user_command == "HOVER":
+            if state.user_command != state.prev_command:
+                print("Hovering hehe")
+
+                state.prev_command = state.user_command
+                take_off(master,state,2)
+                
+        else:
+            if state.user_command != state.prev_command:
+                print("not Hovering hehe")
+                state.prev_command = state.user_command
+                land(master,state,2)
+
 
 def main():
+
+    #connecting to the BCI headset:
+    #init_bci() #opens a serial connection to the BCI device
+
+
     # Instantiate the global state tracker FlightState object
     state = FlightState()
     # Instantiates the drone mavutil object and connects to physical drone
@@ -402,6 +451,8 @@ def main():
     master = mavutil.mavlink_connection('udpin:0.0.0.0:14550')
     master.wait_heartbeat() # Waits till heartbeat connects before proceeding
     print("Heartbeat Connected.")
+
+
 
     # Request STATUSTEXT messages
     master.mav.command_long_send(
@@ -470,6 +521,7 @@ def main():
 
     #TODO: Remove
     try:
+
         #Safety
         #while True:
         #    print("spinning in while loop")
@@ -477,7 +529,7 @@ def main():
 
         # --- MISSION START ---
         #prep_flight(master,state)
-        mission_plan(master,state)
+        demo_mission(master,state)
 
         print("\nMission Complete. Entering Monitor Mode. Press Ctrl+C to Land.")
         
