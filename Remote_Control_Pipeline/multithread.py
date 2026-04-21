@@ -317,8 +317,7 @@ def prep_flight(master, state):
     """Waits for user to arme motors."""
     print("Pre-Flight Checks Initiated...")
     
-    
-        
+
     wait_for_arming(master,state)
 
     #wait for RC to enable guided mode
@@ -459,6 +458,9 @@ def bci_mission(master,state):
                 print("Hovering hehe")
 
                 state.prev_command = "HOVER"
+
+                prep_flight(master,state)
+
                 take_off(master,state,2)
             
         elif command_land:
