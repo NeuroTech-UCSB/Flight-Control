@@ -7,4 +7,6 @@ Welcome to the Neurotech@UCSB Flight-Control repository!
 [Further Ardupilot Documentation](https://ardupilot.org/plane/docs/common-speedybeef405-mini.html)
 
 
+Please refer to the Remote_Control_Pipeline readme for more information
+
 
