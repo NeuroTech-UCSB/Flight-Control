@@ -239,10 +239,12 @@ def user_input_thread(state):
         elif user_cmd == "b" or user_cmd == "bci":
             with state.lock:
                 state.use_bci = True
+            print("set input to use bci")
 
         elif user_cmd == "nb" or user_cmd == "nobci":
             with state.lock:
                 state.use_bci = False
+            print("set input to no bci")
         else:
             state.user_command = prev_cmd #keep last state
             print(f"Unknown command, keeping current user input: {state.user_command}")
@@ -266,9 +268,11 @@ def bci_thread(state):
             if (event == "RELAXED"):
                 with state.lock:
                     state.bci_command = "LAND"
+                print("set bci command to land")
             elif (event == "FOCUSED"):
                 with state.lock:
                     state.bci_command = "HOVER"
+                print("set bci command to hover")
             else:
                 print(f"====Unhandled BCI event {event}====")
 
@@ -443,27 +447,31 @@ def bci_mission(master,state):
 
     #TODO: Move this logic into a safer state machine
     state.prev_command = "STANDBY"
+    print("in bci_mission")
     while True:
 
         command_hover = (state.use_bci and state.bci_command == "HOVER") or (not state.use_bci and state.user_command == "HOVER")
         command_land =  (state.use_bci and state.bci_command == "LAND") or (not state.use_bci and state.user_command == "LAND")
 
+        print(f"commands: hover: {command_hover} land: {command_land}")
         if command_hover:
             if "HOVER" != state.prev_command:
                 print("Hovering hehe")
 
                 state.prev_command = "HOVER"
-                #take_off(master,state,2)
+                take_off(master,state,2)
             
         elif command_land:
             if "LAND" != state.prev_command:
                 print("not Hovering hehe")
 
                 state.prev_command = "LAND"
-                #land(master,state,2)
+                land(master,state,2)
 
         else:
             pass
+
+        time.sleep(0.25)
 
 #listens only to user input
 def demo_mission(master,state):
@@ -488,7 +496,6 @@ def main():
     #connecting to the BCI headset:
     init_bci() #opens a serial connection to the BCI device
 
-
     # Instantiate the global state tracker FlightState object
     state = FlightState()
     # Instantiates the drone mavutil object and connects to physical drone
@@ -496,7 +503,6 @@ def main():
     master = mavutil.mavlink_connection('udpin:0.0.0.0:14550')
     master.wait_heartbeat() # Waits till heartbeat connects before proceeding
     print("Heartbeat Connected.")
-
 
     # Request STATUSTEXT messages
     master.mav.command_long_send(
@@ -578,6 +584,7 @@ def main():
         # --- MISSION START ---
         #prep_flight(master,state)
         #demo_mission(master,state)
+        print("starting BCI mission")
         bci_mission(master,state)
 
         print("\nMission Complete. Entering Monitor Mode. Press Ctrl+C to Land.")
@@ -593,7 +600,7 @@ def main():
 
     except KeyboardInterrupt:
         print("\n\n[USER INTERRUPT].")
-        land(master, rtl=False)
+        land(master, state,rtl=False)
         print("Forcing Land...")
 
     except Exception as e:
